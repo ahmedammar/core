@@ -40,6 +40,7 @@ use OC\Authentication\Exceptions\PasswordLoginForbiddenException;
 use OC\Authentication\Token\IProvider;
 use OC\Authentication\Token\IToken;
 use OC\Hooks\Emitter;
+use OC\Hooks\PublicEmitter;
 use OC_App;
 use OC_User;
 use OC_Util;
@@ -57,7 +58,6 @@ use OCP\IUserManager;
 use OCP\IUserSession;
 use OCP\Session\Exceptions\SessionNotAvailableException;
 use OCP\Util;
-use Symfony\Component\EventDispatcher\Event;
 use Symfony\Component\EventDispatcher\GenericEvent;
 
 /**
@@ -82,7 +82,7 @@ use Symfony\Component\EventDispatcher\GenericEvent;
  */
 class Session implements IUserSession, Emitter {
 
-	/** @var IUserManager $manager */
+	/** @var IUserManager | PublicEmitter $manager */
 	private $manager;
 
 	/** @var ISession $session */
@@ -100,19 +100,24 @@ class Session implements IUserSession, Emitter {
 	/** @var User $activeUser */
 	protected $activeUser;
 
+	/** @var IAppManager */
+	private $appManager;
+
 	/**
 	 * @param IUserManager $manager
 	 * @param ISession $session
 	 * @param ITimeFactory $timeFactory
 	 * @param IProvider $tokenProvider
 	 * @param IConfig $config
+	 * @param IAppManager $appManager
 	 */
-	public function __construct(IUserManager $manager, ISession $session, ITimeFactory $timeFactory, $tokenProvider, IConfig $config) {
+	public function __construct(IUserManager $manager, ISession $session, ITimeFactory $timeFactory, $tokenProvider, IConfig $config, IAppManager $appManager) {
 		$this->manager = $manager;
 		$this->session = $session;
 		$this->timeFactory = $timeFactory;
 		$this->tokenProvider = $tokenProvider;
 		$this->config = $config;
+		$this->appManager = $appManager;
 	}
 
 	/**
@@ -138,15 +143,6 @@ class Session implements IUserSession, Emitter {
 	 */
 	public function removeListener($scope = null, $method = null, callable $callback = null) {
 		$this->manager->removeListener($scope, $method, $callback);
-	}
-
-	/**
-	 * get the manager object
-	 *
-	 * @return Manager
-	 */
-	public function getManager() {
-		return $this->manager;
 	}
 
 	/**
@@ -691,7 +687,7 @@ class Session implements IUserSession, Emitter {
 	 */
 	public function tryTokenLogin(IRequest $request) {
 		$authHeader = $request->getHeader('Authorization');
-		if (strpos($authHeader, 'token ') === false) {
+		if ($authHeader === null || strpos($authHeader, 'token ') === false) {
 			// No auth header, let's try session id
 			try {
 				$token = $this->session->getId();
@@ -719,34 +715,10 @@ class Session implements IUserSession, Emitter {
 	 * @throws Exception If the auth module could not be loaded
 	 */
 	public function tryAuthModuleLogin(IRequest $request) {
-		/** @var IAppManager $appManager */
-		$appManager = OC::$server->query('AppManager');
-		$allApps = $appManager->getInstalledApps();
-
-		foreach ($allApps as $appId) {
-			$info = $appManager->getAppInfo($appId);
-
-			if (isset($info['auth-modules'])) {
-				$authModules = $info['auth-modules'];
-
-				foreach ($authModules as $class) {
-					try {
-						if (!OC_App::isAppLoaded($appId)) {
-							OC_App::loadApp($appId);
-						}
-
-						/** @var IAuthModule $authModule */
-						$authModule = OC::$server->query($class);
-
-						if ($authModule instanceof IAuthModule) {
-							return $this->loginUser($authModule->auth($request), $authModule->getUserPassword($request));
-						} else {
-							throw new Exception("Could not load the auth module $class");
-						}
-					} catch (QueryException $exc) {
-						throw new Exception("Could not load the auth module $class");
-					}
-				}
+		foreach ($this->getAuthModules(false) as $authModule) {
+			$user = $authModule->auth($request);
+			if ($user !== null) {
+				return $this->loginUser($authModule->auth($request), $authModule->getUserPassword($request));
 			}
 		}
 
@@ -907,4 +879,64 @@ class Session implements IUserSession, Emitter {
 		}
 	}
 
+	public function verifyAuthHeaders($request) {
+		foreach ($this->getAuthModules(true) as $module) {
+			$user = $module->auth($request);
+			if ($user !== null) {
+				if ($this->isLoggedIn() && $this->getUser()->getUID() !== $user->getUID()) {
+					// the session is bad -> kill it
+					$this->logout();
+					return false;
+				}
+				return true;
+			}
+		}
+
+		// the session is bad -> kill it
+		$this->logout();
+		return false;
+	}
+
+	/**
+	 * @param $includeBuiltIn
+	 * @return \Generator | IAuthModule[]
+	 * @throws Exception
+	 */
+	private function getAuthModules($includeBuiltIn) {
+		if ($includeBuiltIn) {
+			yield new BasicAuthModule($this->manager);
+			yield new TokenAuthModule($this->session, $this->tokenProvider, $this->manager);
+		}
+
+		// TODO: think about caching modules
+		$allApps = $this->appManager->getInstalledApps();
+
+		foreach ($allApps as $appId) {
+			$info = $this->appManager->getAppInfo($appId);
+
+			if (isset($info['auth-modules'])) {
+				$authModules = $info['auth-modules'];
+
+				foreach ($authModules as $class) {
+					try {
+						if (!OC_App::isAppLoaded($appId)) {
+							OC_App::loadApp($appId);
+						}
+
+						/** @var IAuthModule $authModule */
+						$authModule = OC::$server->query($class);
+
+						if ($authModule instanceof IAuthModule) {
+							yield $authModule;
+						} else {
+							throw new Exception("Could not load the auth module $class");
+						}
+					} catch (QueryException $exc) {
+						throw new Exception("Could not load the auth module $class");
+					}
+				}
+			}
+		}
+
+	}
 }
